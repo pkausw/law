@@ -6,7 +6,7 @@ Base definition of remote workflows based on job submission and status polling.
 
 __all__ = ["JobData", "BaseRemoteWorkflowProxy", "BaseRemoteWorkflow"]
 
-
+import os
 import sys
 import time
 import re
@@ -236,9 +236,30 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
         # intially, set the number of parallel jobs which might change at some piont
         self._set_parallel_jobs(task.parallel_jobs)
 
+        # flag that denotes whether the job data was initialized
+        self._job_data_initialized = False
+
     @property
     def job_data_cls(self):
         return JobData
+    
+    @property
+    def resources(self):
+        if not self._job_data_initialized:
+            self._init_job_data()
+        n_jobs_expected = min(len(self.job_data), self.poll_data.n_parallel)
+        
+        relevant_resource = "{}_{}_{}".format(
+            self._get_task_attribute("flavor"),
+            self.workflow_type,
+            os.environ["USER"],
+        )
+        # check if downstream workflow defines resources
+        ds_resource_def = self._get_task_attribute("resources", dict())()
+        ds_resource_def.update({
+            relevant_resource: ds_resource_def.get(relevant_resource, 1) * n_jobs_expected
+        })
+        return ds_resource_def
 
     @abstractmethod
     def create_job_manager(self, **kwargs):
@@ -563,22 +584,9 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
     def get_run_context(self):
         return self._get_task_attribute("workflow_run_context", fallback=True)()
 
-    def run(self):
-        with self.get_run_context():
-            super(BaseRemoteWorkflowProxy, self).run()
-            return self._run_impl()
-
-    def _run_impl(self):
-        """
-        Actual run method that starts the processing of jobs and initiates the status polling, or
-        performs job cancelling or cleaning, depending on the task parameters.
-        """
+    def _init_job_data(self):
         task = self.task
         self._outputs = self.output()
-
-        # create the job dashboard interface
-        self.dashboard = task.create_job_dashboard() or NoJobDashboard()
-
         # read job data and reset some values
         self._submitted = not task.ignore_submission and self._outputs["jobs"].exists()
         if self._submitted:
@@ -589,7 +597,43 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
 
             # sync other settings
             task.tasks_per_job = self.job_data.tasks_per_job
+
+        else:
+            # set the initial list of unsubmitted jobs
+            branches = sorted(task.branch_map.keys())
+            branch_chunks = list(iter_chunks(branches, task.tasks_per_job))
+            self.job_data.unsubmitted_jobs = OrderedDict(
+                (i + 1, branches) for i, branches in enumerate(branch_chunks)
+                if not self._can_skip_job(i + 1, branches)
+            )
+        self._job_data_initialized = True
+        # from IPython import embed
+        # embed(header="end of self._init_job_data()")
+
+
+    def run(self):
+        with self.get_run_context():
+            super(BaseRemoteWorkflowProxy, self).run()
+            return self._run_impl()
+
+    def _run_impl(self):
+        """
+        Actual run method that starts the processing of jobs and initiates the status polling, or
+        performs job cancelling or cleaning, depending on the task parameters.
+        """
+
+        from IPython import embed
+        embed(header="beginning of _run_impl func of BaseRemoteWorkflowProxy")
+        task = self.task
+        self._outputs = self.output()
+        # create the job dashboard interface
+        self.dashboard = task.create_job_dashboard() or NoJobDashboard()
+        if self._submitted:
             self.dashboard.apply_config(self.job_data.dashboard_config)
+
+        if not self._job_data_initialized:
+            self._init_job_data()
+        
 
         # store the initially complete branches
         if "collection" in self._outputs:
@@ -626,12 +670,12 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
 
             # submit
             if not self._submitted:
-                # set the initial list of unsubmitted jobs
-                branches = sorted(task.branch_map.keys())
-                branch_chunks = list(iter_chunks(branches, task.tasks_per_job))
-                self.job_data.unsubmitted_jobs = OrderedDict(
-                    (i + 1, branches) for i, branches in enumerate(branch_chunks)
-                )
+                # # set the initial list of unsubmitted jobs
+                # branches = sorted(task.branch_map.keys())
+                # branch_chunks = list(iter_chunks(branches, task.tasks_per_job))
+                # self.job_data.unsubmitted_jobs = OrderedDict(
+                #     (i + 1, branches) for i, branches in enumerate(branch_chunks)
+                # )
                 self.submit()
 
             # sleep once to give the job interface time to register the jobs
@@ -742,6 +786,8 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
         task = self.task
         # collect data of jobs that should be submitted: num -> branches
         submit_jobs = OrderedDict()
+        # from IPython import embed
+        # embed(header="beginning of hidden _collect_submit_jobs func of BaseRemoteWorkflowProxy")
 
         # keep track of the list of unsubmitted job nums before retry jobs are handled to control
         # whether they are resubmitted immediately or at the end (subject to shuffling)
@@ -786,6 +832,19 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
             if n < self.poll_data.n_parallel:
                 self.job_data.unsubmitted_jobs.pop(job_num, None)
                 submit_jobs[job_num] = sorted(branches)
+        # from IPython import embed
+        # embed(header="in hidden _collect_submit_jobs func of BaseRemoteWorkflowProxy")
+        return submit_jobs
+
+    def submit(self, retry_jobs=None):
+        """
+        Submits all jobs. When *retry_jobs* is *None*, a new job list is built. Otherwise,
+        previously failed jobs defined in the *retry_jobs* dictionary, which maps job numbers to
+        lists of branch numbers, are used.
+        """
+        task = self.task
+
+        submit_jobs = self._collect_submit_jobs(retry_jobs)
 
         # store submission data for jobs about to be submitted
         new_submission_data = OrderedDict()
@@ -800,18 +859,6 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
         for job_num, branches in six.iteritems(submit_jobs):
             job_data = self.job_data_cls.job_data(branches=branches)
             self.job_data.jobs[job_num] = job_data
-        
-        return submit_jobs
-
-    def submit(self, retry_jobs=None):
-        """
-        Submits all jobs. When *retry_jobs* is *None*, a new job list is built. Otherwise,
-        previously failed jobs defined in the *retry_jobs* dictionary, which maps job numbers to
-        lists of branch numbers, are used.
-        """
-        task = self.task
-
-        submit_jobs = self._collect_submit_jobs(retry_jobs)
 
         # log some stats
         dst_info = self._destination_info_postfix()
