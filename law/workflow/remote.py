@@ -737,15 +737,9 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
                     if remaining > 0:
                         print("    ... and {} more".format(remaining))
                     break
-
-    def submit(self, retry_jobs=None):
-        """
-        Submits all jobs. When *retry_jobs* is *None*, a new job list is built. Otherwise,
-        previously failed jobs defined in the *retry_jobs* dictionary, which maps job numbers to
-        lists of branch numbers, are used.
-        """
+    
+    def _collect_submit_jobs(self, retry_jobs=None):
         task = self.task
-
         # collect data of jobs that should be submitted: num -> branches
         submit_jobs = OrderedDict()
 
@@ -806,6 +800,18 @@ class BaseRemoteWorkflowProxy(BaseWorkflowProxy):
         for job_num, branches in six.iteritems(submit_jobs):
             job_data = self.job_data_cls.job_data(branches=branches)
             self.job_data.jobs[job_num] = job_data
+        
+        return submit_jobs
+
+    def submit(self, retry_jobs=None):
+        """
+        Submits all jobs. When *retry_jobs* is *None*, a new job list is built. Otherwise,
+        previously failed jobs defined in the *retry_jobs* dictionary, which maps job numbers to
+        lists of branch numbers, are used.
+        """
+        task = self.task
+
+        submit_jobs = self._collect_submit_jobs(retry_jobs)
 
         # log some stats
         dst_info = self._destination_info_postfix()
